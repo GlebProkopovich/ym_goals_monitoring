@@ -1,7 +1,7 @@
 import os
 import requests
-from utils.logger import logger
 from dotenv import load_dotenv
+from utils.logger import logger
 
 
 # Загрузка переменных из файла .env

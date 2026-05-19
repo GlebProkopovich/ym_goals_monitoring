@@ -14,7 +14,9 @@ def extract_goals_info(db_config):
                        (goal_id, counter_id, agency_name)
    """
     logger.info("Извлечение целей, из таблицы ym_goals...")
+
     tracking_goals_info = []
+
     with get_db_connection(db_config) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT
@@ -37,6 +39,6 @@ def extract_goals_info(db_config):
         for row in results:
             tracking_goals_info.append(row)
 
-        logger.info(f"Извлечено {len(tracking_goals_info)} целей из таблицы ym_goals")
+    logger.info(f"Извлечено {len(tracking_goals_info)} целей из таблицы ym_goals")
 
-        return tracking_goals_info
+    return tracking_goals_info

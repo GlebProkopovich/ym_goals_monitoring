@@ -6,6 +6,40 @@ from utils.logger import logger
 load_dotenv()
 
 
+def _normalize_counters(counters):
+    """
+    Приводит входные данные счетчиков к формату [(counter_id, agency_name), ...].
+
+    Поддерживает:
+    - список кортежей (counter_id, agency_name);
+    - список словарей, где есть ключи id и agency_name.
+    """
+    normalized = []
+    skipped = 0
+
+    for item in counters:
+        if isinstance(item, tuple):
+            if len(item) == 2:
+                normalized.append((item[0], item[1]))
+            else:
+                skipped += 1
+        elif isinstance(item, dict):
+            counter_id = item.get("id")
+            agency_name = item.get("agency_name")
+            if counter_id is None or not isinstance(agency_name, str) or not agency_name.strip():
+                skipped += 1
+                continue
+            normalized.append((counter_id, agency_name))
+        else:
+            skipped += 1
+
+    logger.info(
+        f"Нормализация счетчиков для целей: получено {len(counters)}, "
+        f"валидных {len(normalized)}, пропущено {skipped}"
+    )
+    return normalized
+
+
 def fetch_goals_info(counters):
     """
     Получает список всех целей для каждого счетчика через API управления Яндекс.Метрики (management/v1).
@@ -27,9 +61,18 @@ def fetch_goals_info(counters):
     all_goals = []
     processed_counters = 0
 
-    logger.info(f"Начало получения списка целей для {len(counters)} счетчиков")
+    counters_for_request = _normalize_counters(counters)
+    if not counters_for_request:
+        error_msg = (
+            "После нормализации не осталось валидных счетчиков. "
+            "Проверьте формат counters и наличие agency_name."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
-    for counter_id, agency_name in counters:
+    logger.info(f"Начало получения списка целей для {len(counters_for_request)} счетчиков")
+
+    for counter_id, agency_name in counters_for_request:
         token = os.getenv(f"YM_API_TOKEN_{agency_name}")
         if not token:
             logger.warning(f"Токен не найден для агентства {agency_name} (ID счётчика: {counter_id}) — пропускаем")
@@ -65,5 +108,5 @@ def fetch_goals_info(counters):
         logger.error(error_msg)
         raise ValueError(error_msg)
 
-    logger.info(f"Успешно обработано {processed_counters}/{len(counters)} счетчиков")
+    logger.info(f"Успешно обработано {processed_counters}/{len(counters_for_request)} счетчиков")
     return all_goals

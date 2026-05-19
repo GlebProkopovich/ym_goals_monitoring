@@ -53,6 +53,7 @@ def fetch_counters(agencies_info):
             # Добавляем agency_id к каждому счетчику
             for counter in counters:
                 counter['agency_id'] = agency_id
+                counter['agency_name'] = agency_name
 
             all_counters.extend(counters)
 

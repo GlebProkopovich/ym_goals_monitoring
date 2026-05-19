@@ -1,5 +1,5 @@
-from db.db_connection import get_db_connection
 from utils.logger import logger
+from db.db_connection import get_db_connection
 
 
 def extract_counters(db_config):
@@ -24,6 +24,7 @@ def extract_counters(db_config):
     logger.info("Извлечение списка счетчиков Яндекс.Метрики с привязанными агентствами из базы данных...")
 
     counters = []
+
     with get_db_connection(db_config) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT DISTINCT
