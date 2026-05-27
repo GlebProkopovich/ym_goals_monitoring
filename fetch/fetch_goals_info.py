@@ -1,6 +1,8 @@
 import os
 import requests
 from dotenv import load_dotenv
+
+from utils.http_retry import request_with_retry
 from utils.logger import logger
 
 load_dotenv()
@@ -82,8 +84,7 @@ def fetch_goals_info(counters):
         headers = {'Authorization': f'OAuth {token}'}
 
         try:
-            response = requests.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
+            response = request_with_retry("GET", url, headers=headers, timeout=30)
             response_json = response.json()
             goals = response_json.get('goals', [])
 

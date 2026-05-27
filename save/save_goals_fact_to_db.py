@@ -12,6 +12,10 @@ def save_goals_fact_to_db(db_config, goals_fact):
     :param goals_fact: Список словарей, каждый из которых содержит данные о достижении цели с ключами:
                        'date', 'goal_id', 'reaches'.
     """
+    if not goals_fact:
+        logger.warning("Пустой список фактов — сохранение пропущено")
+        return
+
     try:
         with get_db_connection(db_config) as conn, conn.cursor() as cur:
             logger.info("Соединение с базой данных установлено.")

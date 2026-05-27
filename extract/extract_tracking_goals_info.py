@@ -44,3 +44,21 @@ def extract_tracking_goals_info(db_config):
         logger.info(f"Извлечено {len(tracking_goals_info)} целей для мониторинга")
 
         return tracking_goals_info
+
+
+def extract_counters_for_tracking_goals(tracking_goals_info):
+    """
+    Уникальные счётчики среди целей в мониторинге.
+
+    Returns:
+        list[tuple]: [(counter_id, agency_name), ...]
+    """
+    seen = set()
+    counters = []
+    for _goal_id, counter_id, agency_name in tracking_goals_info:
+        key = (counter_id, agency_name)
+        if key not in seen:
+            seen.add(key)
+            counters.append(key)
+    logger.info(f"Для мониторинга нужно {len(counters)} уникальных счётчиков")
+    return counters

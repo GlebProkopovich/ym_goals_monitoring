@@ -2,46 +2,42 @@ from utils.logger import logger
 from db.db_connection import get_db_connection
 
 
-def extract_counters(db_config):
-    """Извлекает список счетчиков Яндекс.Метрики с привязанными агентствами из базы данных.
-
-    Подключается к указанной базе данных и выполняет SQL-запрос для получения списка
-    уникальных связок (id счетчика, название агентства) из таблиц ym_counters и agencies.
-
-    Args:
-        db_config (dict): Конфигурация подключения к БД, содержащая параметры:
-            - host (str): Хост БД
-            - port (int): Порт БД
-            - database (str): Имя базы данных
-            - user (str): Имя пользователя
-            - password (str): Пароль пользователя
-
-    Returns:
-        list[tuple]: Список кортежей, где каждый кортеж содержит:
-            - counter_id (int): ID счетчика Яндекс.Метрики
-            - agency_name (str): Название агентства, к которому привязан счетчик
+def extract_counters(db_config=None, *, api_counters=None):
     """
-    logger.info("Извлечение списка счетчиков Яндекс.Метрики с привязанными агентствами из базы данных...")
+    Возвращает список счётчиков в формате [(counter_id, agency_name), ...].
+
+    Режимы:
+    - api_counters задан — подготовка списка из ответа API (для sync_metadata);
+    - иначе — чтение всех счётчиков из БД (ym_counters + agencies).
+    """
+    if api_counters is not None:
+        logger.info("Подготовка списка счётчиков из ответа API...")
+        counters = [(counter["id"], counter["agency_name"]) for counter in api_counters]
+        logger.info(f"Подготовлено {len(counters)} счётчиков из API")
+        return counters
+
+    if db_config is None:
+        raise ValueError("Нужен db_config, если api_counters не передан")
+
+    logger.info(
+        "Извлечение списка счетчиков Яндекс.Метрики с привязанными агентствами из базы данных..."
+    )
 
     counters = []
 
     with get_db_connection(db_config) as conn, conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT DISTINCT
-                c.id as counter_id, 
-                a.name as agency_name
-            FROM 
-                ym_counters c
-            JOIN
-                agencies a
-            ON
-                c.agency_id = a.id
-        """)
+                c.id AS counter_id,
+                a.name AS agency_name
+            FROM ym_counters c
+            JOIN agencies a ON c.agency_id = a.id
+            """
+        )
 
-        results = cur.fetchall()
-        for row in results:
+        for row in cur.fetchall():
             counters.append(row)
 
-    logger.info(f"Извлечено {len(counters)} счетчиков")
-
+    logger.info(f"Извлечено {len(counters)} счетчиков из БД")
     return counters

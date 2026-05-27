@@ -1,93 +1,297 @@
-from db.db_config import DB_CONFIG
 from datetime import datetime, timedelta
+
+from psycopg2.extras import execute_values
+
 from db.db_connection import get_db_connection
-from telegram.alert_sender import send_telegram_message
+from monitoring.periods import facts_date_range
+from telegram.alert_sender import notify_monitoring
+from utils.logger import logger
+
+STATUS_ACTIVE = "active"
+STATUS_BROKEN = "broken"
+STATUS_INACTIVE = "inactive"
+
+# Категории по сумме срабатываний за эталонные 10 дней (без вчера)
+CAT_HIGH = "high"   # >= 50 — частая, проверка за 1 день
+CAT_MID = "mid"     # >= 20 и < 50 — средняя частота, за 2 дня
+CAT_LOW = "low"     # < 20 — редкая, за 3 дня
+
+CATEGORY_NAMES = {
+    CAT_HIGH: "высокая частота срабатываний",
+    CAT_MID: "средняя частота срабатываний",
+    CAT_LOW: "низкая частота срабатываний",
+}
 
 
-def find_broken_goals(db_config):
-    today = datetime.now().date()
-    period1_start = today - timedelta(days=10)
-    period1_end = today - timedelta(days=4)
-    period2_start = today - timedelta(days=3)
-    period2_end = today - timedelta(days=1)
+def _sum_for_days(reaches_by_date, day_start, day_end):
+    """Сумма reaches за период [day_start, day_end] включительно."""
+    total = 0
+    current = day_start
+    while current <= day_end:
+        total += reaches_by_date.get(current, 0)
+        current += timedelta(days=1)
+    return total
 
-    broken_goals = []
-    goal_blocks = []
+
+def _recent_days(yesterday, category):
+    """Дни «последнего окна» для проверки поломки/восстановления."""
+    if category == CAT_HIGH:
+        return [yesterday]
+    if category == CAT_MID:
+        return [yesterday - timedelta(days=1), yesterday]
+    return [yesterday - timedelta(days=2), yesterday - timedelta(days=1), yesterday]
+
+
+def _recent_sum(reaches_by_date, yesterday, category):
+    return sum(reaches_by_date.get(d, 0) for d in _recent_days(yesterday, category))
+
+
+def _tier_baseline_window(yesterday, tier):
+    """
+    Эталонные 10 дней для определения категории (без учёта вчера).
+    При вчера = 20 мая: high 10–19, mid 9–18, low 8–17.
+    """
+    if tier == CAT_HIGH:
+        return yesterday - timedelta(days=10), yesterday - timedelta(days=1)
+    if tier == CAT_MID:
+        return yesterday - timedelta(days=11), yesterday - timedelta(days=2)
+    return yesterday - timedelta(days=12), yesterday - timedelta(days=3)
+
+
+def _classify_goal(reaches_by_date, yesterday):
+    """
+    Возвращает категорию цели или None, если цель не мониторится (<= 5 за 10 дней с вчера).
+    """
+    screening_start = yesterday - timedelta(days=9)
+    screening_sum = _sum_for_days(reaches_by_date, screening_start, yesterday)
+    if screening_sum <= 5:
+        return None
+
+    high_start, high_end = _tier_baseline_window(yesterday, CAT_HIGH)
+    if _sum_for_days(reaches_by_date, high_start, high_end) >= 50:
+        return CAT_HIGH
+
+    mid_start, mid_end = _tier_baseline_window(yesterday, CAT_MID)
+    if _sum_for_days(reaches_by_date, mid_start, mid_end) >= 20:
+        return CAT_MID
+
+    return CAT_LOW
+
+
+def _format_period(day_start, day_end):
+    return f"{day_start} - {day_end}"
+
+
+def _category_label(category):
+    """Человекочитаемое название категории для уведомлений."""
+    return CATEGORY_NAMES.get(category, category)
+
+
+def _load_goals_and_facts(db_config, yesterday):
+    """Цели в мониторинге и их факты за нужный диапазон дат."""
+    data_start, _data_end = facts_date_range(yesterday)
+    goals = {}
 
     with get_db_connection(db_config) as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT 
-                gf.goal_id,
-                gf.date,
-                gf.reaches,
+        cur.execute(
+            """
+            SELECT
+                g.id AS goal_id,
                 g.name AS goal_name,
                 c.id AS counter_id,
                 c.name AS counter_name,
-                a.name AS agency_name
-            FROM 
-                ym_goals_fact gf
-            JOIN ym_goals g ON gf.goal_id = g.id
+                a.name AS agency_name,
+                gf.date,
+                gf.reaches
+            FROM ym_goals g
             JOIN ym_counters c ON g.counter_id = c.id
             JOIN agencies a ON c.agency_id = a.id
-            WHERE 
-                gf.date BETWEEN %s AND %s
-            ORDER BY 
-                gf.goal_id, gf.date
-        """, (period1_start, period2_end))
-
-        goals_data = {}
-
-        for goal_id, date, reaches, goal_name, counter_id, counter_name, agency_name in cur.fetchall():
-            if goal_id not in goals_data:
-                goals_data[goal_id] = {
-                    'dates': {},
-                    'goal_name': goal_name,
-                    'counter_id': counter_id,
-                    'counter_name': counter_name,
-                    'agency_name': agency_name
-                }
-            goals_data[goal_id]['dates'][date] = reaches
-
-    for goal_id, goal_info in goals_data.items():
-        date_reaches = goal_info['dates']
-
-        period1_reaches = sum(
-            date_reaches.get(period1_start + timedelta(n), 0)
-            for n in range((period1_end - period1_start).days + 1)
+            LEFT JOIN ym_goals_fact gf
+                ON g.id = gf.goal_id
+                AND gf.date BETWEEN %s AND %s
+            WHERE g.start_monitoring_date IS NOT NULL
+              AND g.start_monitoring_date <= %s
+            ORDER BY g.id, gf.date
+            """,
+            (data_start, yesterday, yesterday),
         )
 
-        if period1_reaches < 5:
+        for goal_id, goal_name, counter_id, counter_name, agency_name, fact_date, reaches in cur.fetchall():
+            if goal_id not in goals:
+                goals[goal_id] = {
+                    "goal_name": goal_name,
+                    "counter_id": counter_id,
+                    "counter_name": counter_name,
+                    "agency_name": agency_name,
+                    "dates": {},
+                }
+            if fact_date is not None:
+                goals[goal_id]["dates"][fact_date] = reaches
+
+    return goals
+
+
+def _load_statuses(db_config):
+    """Текущие статусы целей: goal_id -> {status, date}."""
+    statuses = {}
+    with get_db_connection(db_config) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT goal_id, status, date
+            FROM ym_goals_statuses
+            """
+        )
+        for goal_id, status, status_date in cur.fetchall():
+            statuses[goal_id] = {"status": status, "date": status_date}
+    return statuses
+
+
+def _save_statuses_batch(db_config, status_updates):
+    """Пакетное сохранение статусов одним подключением к БД."""
+    if not status_updates:
+        return
+
+    with get_db_connection(db_config) as conn, conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO ym_goals_statuses (date, goal_id, status)
+            VALUES %s
+            ON CONFLICT (goal_id) DO UPDATE SET
+                date = EXCLUDED.date,
+                status = EXCLUDED.status
+            """,
+            status_updates,
+            template="(%s, %s, %s)",
+        )
+        conn.commit()
+    logger.info(f"Сохранено/обновлено {len(status_updates)} статусов в ym_goals_statuses")
+
+
+def _notification_sort_key(goal_info, goal_id):
+    """Порядок в уведомлениях: агентство → счётчик → название цели → id цели."""
+    return (
+        goal_info["agency_name"],
+        goal_info["counter_name"],
+        goal_info["counter_id"],
+        goal_info["goal_name"],
+        goal_id,
+    )
+
+
+def _format_goal_block(goal_info, goal_id, category, yesterday, reaches_by_date, event_type):
+    baseline_start, baseline_end = _tier_baseline_window(yesterday, category)
+    baseline_sum = _sum_for_days(reaches_by_date, baseline_start, baseline_end)
+    recent_days = _recent_days(yesterday, category)
+    recent_start, recent_end = min(recent_days), max(recent_days)
+    recent_sum = sum(reaches_by_date.get(d, 0) for d in recent_days)
+
+    title = "🔴 Цель перестала срабатывать" if event_type == "broken" else "🟢 Цель снова работает"
+
+    return (
+        f"{title}\n"
+        f"• Агентство: {goal_info['agency_name']}\n"
+        f"• Счётчик: {goal_info['counter_name']} (ID {goal_info['counter_id']})\n"
+        f"• Цель: {goal_info['goal_name']} (ID {goal_id})\n"
+        f"• Категория: {_category_label(category)}\n"
+        f"• Эталонные 10 дней ({_format_period(baseline_start, baseline_end)}): {baseline_sum} срабатываний\n"
+        f"• Проверяемое окно ({_format_period(recent_start, recent_end)}): {recent_sum} срабатываний\n\n"
+    )
+
+
+def find_broken_goals(db_config):
+    """
+    Проверяет цели на поломку и восстановление, сохраняет статусы в ym_goals_statuses,
+    выводит уведомления в консоль; Telegram — при TELEGRAM_ENABLED=true.
+    Цели с <= 5 срабатываний получают статус inactive без уведомлений.
+    """
+    yesterday = datetime.now().date() - timedelta(days=1)
+    logger.info(f"Старт мониторинга целей, последний учитываемый день: {yesterday}")
+
+    goals = _load_goals_and_facts(db_config, yesterday)
+    statuses = _load_statuses(db_config)
+
+    broken_entries = []
+    recovered_entries = []
+    broken_goal_ids = []
+    status_updates = []
+
+    for goal_id, goal_info in goals.items():
+        reaches_by_date = goal_info["dates"]
+        category = _classify_goal(reaches_by_date, yesterday)
+
+        prev = statuses.get(goal_id)
+        prev_status = prev["status"] if prev else None
+
+        if category is None:
+            if prev_status != STATUS_INACTIVE:
+                status_updates.append((yesterday, goal_id, STATUS_INACTIVE))
+                logger.info(
+                    f"Цель {goal_id}: <= 5 срабатываний за 10 дней с вчера, статус inactive (без уведомления)"
+                )
             continue
 
-        period2_reaches = sum(
-            date_reaches.get(period2_start + timedelta(n), 0)
-            for n in range((period2_end - period2_start).days + 1)
+        recent_sum = _recent_sum(reaches_by_date, yesterday, category)
+        is_broken = recent_sum == 0
+        is_recovered = prev_status == STATUS_BROKEN and recent_sum >= 1
+
+        if is_broken:
+            if prev_status != STATUS_BROKEN:
+                broken_goal_ids.append(goal_id)
+                broken_entries.append((
+                    _notification_sort_key(goal_info, goal_id),
+                    _format_goal_block(
+                        goal_info, goal_id, category, yesterday, reaches_by_date, "broken"
+                    ),
+                ))
+                logger.info(f"Цель {goal_id}: поломка, вывод в консоль")
+            else:
+                logger.info(f"Цель {goal_id}: по-прежнему сломана, уведомление не дублируем")
+
+            status_updates.append((yesterday, goal_id, STATUS_BROKEN))
+
+        elif is_recovered:
+            recovered_entries.append((
+                _notification_sort_key(goal_info, goal_id),
+                _format_goal_block(
+                    goal_info, goal_id, category, yesterday, reaches_by_date, "recovered"
+                ),
+            ))
+            status_updates.append((yesterday, goal_id, STATUS_ACTIVE))
+            logger.info(f"Цель {goal_id}: восстановлена, вывод в консоль")
+
+        else:
+            if prev_status != STATUS_ACTIVE:
+                status_updates.append((yesterday, goal_id, STATUS_ACTIVE))
+                if prev_status is not None:
+                    logger.info(f"Цель {goal_id}: статус обновлён на active")
+            # Уже active — в таблице ничего не меняем (кроме случая восстановления выше)
+
+    _save_statuses_batch(db_config, status_updates)
+
+    broken_entries.sort(key=lambda item: item[0])
+    recovered_entries.sort(key=lambda item: item[0])
+    broken_notifications = [text for _, text in broken_entries]
+    recovered_notifications = [text for _, text in recovered_entries]
+
+    if broken_notifications:
+        broken_text = (
+            "🔍 Обнаружены потенциально сломанные цели:\n\n"
+            + ("—" * 30 + "\n\n").join(broken_notifications)
         )
+        notify_monitoring(broken_text)
+    elif not recovered_notifications:
+        notify_monitoring("✅ Сломанных целей не обнаружено.")
 
-        if period2_reaches == 0:
-            broken_goals.append(goal_id)
-
-            block = (
-                f"• Агентство: {goal_info['agency_name']}\n"
-                f"• Название счетчика: {goal_info['counter_name']}\n"
-                f"• ID счетчика: {goal_info['counter_id']}\n"
-                f"• Название цели: {goal_info['goal_name']}\n"
-                f"• ID цели: {goal_id}\n"
-                f"📊 Статистика по периодам:\n"
-                f"  ├─ Период 1 ({period1_start} – {period1_end}): {period1_reaches} достижений\n"
-                f"  └─ Период 2 ({period2_start} – {period2_end}): {period2_reaches} достижений\n\n"
-            )
-            goal_blocks.append(block)
-
-    if goal_blocks:
-        message_text = (
-            "🔍 Обнаружены потенциально сломанные цели:" +
-            "\n\n" + ("—" * 30 + "\n\n").join(goal_blocks)
+    if recovered_notifications:
+        recovered_text = (
+            "✅ Цели снова начали срабатывать:\n\n"
+            + ("—" * 30 + "\n\n").join(recovered_notifications)
         )
-    else:
-        message_text = "✅ Все цели работают корректно."
+        notify_monitoring(recovered_text)
 
-    send_telegram_message(message_text)
-    print(message_text)
-
-    return broken_goals
+    logger.info(
+        f"Мониторинг завершён: сломанных (новых) {len(broken_goal_ids)}, "
+        f"восстановленных {len(recovered_notifications)}"
+    )
+    return broken_goal_ids

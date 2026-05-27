@@ -34,7 +34,7 @@ def extract_agencies_info(db_config):
         with get_db_connection(db_config) as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT id, name
-                FROM ym_goals_monitoring.agencies
+                FROM agencies
             """)
 
             agencies = [(agency[0], agency[1]) for agency in cur.fetchall()]
