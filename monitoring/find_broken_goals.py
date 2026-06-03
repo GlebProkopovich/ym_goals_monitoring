@@ -4,17 +4,20 @@ from psycopg2.extras import execute_values
 
 from db.db_connection import get_db_connection
 from monitoring.periods import facts_date_range
-from telegram.alert_sender import notify_monitoring
+from telegram.alert_sender import notify_console, notify_monitoring
 from utils.logger import logger
 
 STATUS_ACTIVE = "active"
 STATUS_BROKEN = "broken"
 STATUS_INACTIVE = "inactive"
+SCREENING_INACTIVE_SUM_MAX = 10
 
-# Категории по сумме срабатываний за эталонные 10 дней (без вчера)
-CAT_HIGH = "high"   # >= 50 — частая, проверка за 1 день
-CAT_MID = "mid"     # >= 20 и < 50 — средняя частота, за 2 дня
-CAT_LOW = "low"     # < 20 — редкая, за 3 дня
+# Категории по сумме срабатываний за эталонные 10 дней (без вчера), после screening
+CAT_HIGH = "high"   # эталон high ≥ CAT_HIGH_SUM_MIN — частая, проверка за 1 день
+CAT_MID = "mid"     # эталон mid ≥ CAT_MID_SUM_MIN при эталоне high < CAT_HIGH_SUM_MIN — за 2 дня
+CAT_LOW = "low"     # эталон mid < CAT_MID_SUM_MIN — редкая, за 3 дня
+CAT_HIGH_SUM_MIN = 100
+CAT_MID_SUM_MIN = 50
 
 CATEGORY_NAMES = {
     CAT_HIGH: "высокая частота срабатываний",
@@ -60,19 +63,20 @@ def _tier_baseline_window(yesterday, tier):
 
 def _classify_goal(reaches_by_date, yesterday):
     """
-    Возвращает категорию цели или None, если цель не мониторится (<= 5 за 10 дней с вчера).
+    Возвращает категорию цели или None, если цель не мониторится
+    (<= SCREENING_INACTIVE_SUM_MAX за 10 дней с вчера).
     """
     screening_start = yesterday - timedelta(days=9)
     screening_sum = _sum_for_days(reaches_by_date, screening_start, yesterday)
-    if screening_sum <= 5:
+    if screening_sum <= SCREENING_INACTIVE_SUM_MAX:
         return None
 
     high_start, high_end = _tier_baseline_window(yesterday, CAT_HIGH)
-    if _sum_for_days(reaches_by_date, high_start, high_end) >= 50:
+    if _sum_for_days(reaches_by_date, high_start, high_end) >= CAT_HIGH_SUM_MIN:
         return CAT_HIGH
 
     mid_start, mid_end = _tier_baseline_window(yesterday, CAT_MID)
-    if _sum_for_days(reaches_by_date, mid_start, mid_end) >= 20:
+    if _sum_for_days(reaches_by_date, mid_start, mid_end) >= CAT_MID_SUM_MIN:
         return CAT_MID
 
     return CAT_LOW
@@ -190,6 +194,7 @@ def _format_goal_block(goal_info, goal_id, category, yesterday, reaches_by_date,
 
     return (
         f"{title}\n"
+        f"\n"
         f"• Агентство: {goal_info['agency_name']}\n"
         f"• Счётчик: {goal_info['counter_name']} (ID {goal_info['counter_id']})\n"
         f"• Цель: {goal_info['goal_name']} (ID {goal_id})\n"
@@ -199,16 +204,30 @@ def _format_goal_block(goal_info, goal_id, category, yesterday, reaches_by_date,
     )
 
 
-def find_broken_goals(db_config):
+def find_broken_goals(db_config, skip_counter_ids=None):
     """
     Проверяет цели на поломку и восстановление, сохраняет статусы в ym_goals_statuses,
     выводит уведомления в консоль; Telegram — при TELEGRAM_ENABLED=true.
-    Цели с <= 5 срабатываний получают статус inactive без уведомлений.
+    Цели с <= SCREENING_INACTIVE_SUM_MAX срабатываний получают статус inactive без уведомлений.
+    Если передан skip_counter_ids, цели этих счётчиков полностью исключаются из проверки
+    на текущий прогон (например, при частичном сбое загрузки фактов из API).
     """
     yesterday = datetime.now().date() - timedelta(days=1)
     logger.info(f"Старт мониторинга целей, последний учитываемый день: {yesterday}")
 
     goals = _load_goals_and_facts(db_config, yesterday)
+    skip_counter_ids = set(skip_counter_ids or [])
+    if skip_counter_ids:
+        goals = {
+            goal_id: goal_info
+            for goal_id, goal_info in goals.items()
+            if goal_info["counter_id"] not in skip_counter_ids
+        }
+        logger.warning(
+            "Проверка сломанных целей частично пропущена: "
+            f"{len(skip_counter_ids)} счётчиков с ошибкой API; "
+            f"список счётчиков: {sorted(skip_counter_ids)}"
+        )
     statuses = _load_statuses(db_config)
 
     broken_entries = []
@@ -227,7 +246,8 @@ def find_broken_goals(db_config):
             if prev_status != STATUS_INACTIVE:
                 status_updates.append((yesterday, goal_id, STATUS_INACTIVE))
                 logger.info(
-                    f"Цель {goal_id}: <= 5 срабатываний за 10 дней с вчера, статус inactive (без уведомления)"
+                    f"Цель {goal_id}: <= {SCREENING_INACTIVE_SUM_MAX} срабатываний за 10 дней с вчера, "
+                    f"статус inactive (без уведомления)"
                 )
             continue
 
@@ -288,7 +308,8 @@ def find_broken_goals(db_config):
             "✅ Цели снова начали срабатывать:\n\n"
             + ("—" * 30 + "\n\n").join(recovered_notifications)
         )
-        notify_monitoring(recovered_text)
+        notify_console(recovered_text)
+        logger.info(recovered_text)
 
     logger.info(
         f"Мониторинг завершён: сломанных (новых) {len(broken_goal_ids)}, "

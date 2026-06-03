@@ -5,7 +5,8 @@ from dotenv import load_dotenv
 
 from db.db_connection import get_db_connection
 from monitoring.periods import facts_date_range
-from utils.http_retry import request_with_retry
+from telegram.alert_sender import send_pipeline_error_alert
+from utils.http_retry import format_request_exception_detail, request_with_retry
 from utils.logger import logger
 
 load_dotenv()
@@ -126,7 +127,7 @@ def fetch_goals_fact(counters, db_config=None, tracking_goals_info=None):
         params = {
             "ids": counter_id,
             "dimensions": "ym:s:date, ym:s:goal",
-            "metrics": "ym:s:sumGoalReachesAny",
+            "metrics": "ym:s:anyGoalReaches",
             "date1": start_date,
             "date2": end_date,
             "attribution": "cross_device_last_significant",
@@ -171,11 +172,16 @@ def fetch_goals_fact(counters, db_config=None, tracking_goals_info=None):
             )
 
         except Exception as e:
-            logger.error(f"Ошибка API для счетчика {counter_id}: {e}")
+            request_context = {
+                "url": url,
+                "params": {**params, "ids": counter_id},
+            }
+            detail = format_request_exception_detail(e, request_context=request_context)
+            logger.error(f"Ошибка API для счетчика {counter_id} ({agency_name}): {detail}")
             api_errors.append({
                 "counter_id": counter_id,
                 "agency_name": agency_name,
-                "error": str(e),
+                "error": detail,
             })
 
     logger.info(
@@ -184,3 +190,43 @@ def fetch_goals_fact(counters, db_config=None, tracking_goals_info=None):
         f"ошибок API {len(api_errors)}"
     )
     return goals_fact, api_errors
+
+
+def _format_counter_api_error(entry: dict) -> str:
+    """Один счётчик в сообщении об ошибке: заголовок и детали с отступом."""
+    detail = entry["error"].replace("\n", "\n    ")
+    return (
+        f"  • счётчик {entry['counter_id']} ({entry['agency_name']}):\n"
+        f"\n"
+        f"    {detail}"
+    )
+
+
+def format_partial_fetch_errors_message(api_errors: list) -> str:
+    """Текст алерта при частичном сбое загрузки фактов из API."""
+    if not api_errors:
+        return ""
+
+    counter_blocks = [_format_counter_api_error(e) for e in api_errors[:20]]
+    if len(api_errors) > 20:
+        counter_blocks.append(f"  … и ещё {len(api_errors) - 20} счётчиков")
+    return (
+        "Частичная ошибка загрузки фактов: не удалось получить данные "
+        f"для {len(api_errors)} счётчиков:\n"
+        "\n"
+        + "\n\n".join(counter_blocks)
+    )
+
+
+def failed_counter_ids_from_api_errors(api_errors: list) -> set:
+    """ID счётчиков, по которым не удалось получить факты в текущем прогоне."""
+    return {e["counter_id"] for e in api_errors if e.get("counter_id") is not None}
+
+
+def report_partial_fetch_errors(api_errors: list) -> None:
+    """Лог и алерт (консоль / Telegram) при частичном сбое fetch_goals_fact."""
+    message = format_partial_fetch_errors_message(api_errors)
+    if not message:
+        return
+    logger.error(message)
+    send_pipeline_error_alert("fetch_goals_fact (частичный сбой)", message, "")

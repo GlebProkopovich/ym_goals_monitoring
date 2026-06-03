@@ -179,8 +179,10 @@ def send_pipeline_error_alert(stage: str, error_message: str, traceback_text: st
     """
     short_text = (
         "⚠️ Ошибка ym_goals_monitoring\n"
+        "\n"
         f"Этап: {stage}\n"
-        f"Ошибка: {error_message}"
+        "\n"
+        f"Ошибка:\n{error_message}"
     )
     full_text = f"{short_text}\n\n{traceback_text}"
 
