@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from db.db_connection import get_db_connection
 from monitoring.periods import facts_date_range
-from telegram.alert_sender import send_pipeline_error_alert
+from telegram.alert_sender import GOAL_BLOCK_DELIMITER, send_pipeline_error_alert
 from utils.http_retry import format_request_exception_detail, request_with_retry
 from utils.logger import logger
 
@@ -214,7 +214,7 @@ def format_partial_fetch_errors_message(api_errors: list) -> str:
         "Частичная ошибка загрузки фактов: не удалось получить данные "
         f"для {len(api_errors)} счётчиков:\n"
         "\n"
-        + "\n\n".join(counter_blocks)
+        + GOAL_BLOCK_DELIMITER.join(counter_blocks)
     )
 
 
