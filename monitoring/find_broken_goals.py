@@ -300,7 +300,7 @@ def find_broken_goals(db_config, skip_counter_ids=None):
             + ("—" * 30 + "\n\n").join(broken_notifications)
         )
         notify_monitoring(broken_text)
-    elif not recovered_notifications:
+    else:
         notify_monitoring("✅ Сломанных целей не обнаружено.")
 
     if recovered_notifications:
